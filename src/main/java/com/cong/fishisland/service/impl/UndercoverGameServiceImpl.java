@@ -604,6 +604,7 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                 }
 
                 MessageWrapper messageWrapper = getSystemMessageWrapper(gameStartMessage);
+                messageWrapper.getMessage().setRoomId(roomId);
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.UNDERCOVER.getType())
                         .data(messageWrapper).build());
@@ -675,19 +676,33 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
 
         // 确定卧底数量（约1/3的玩家，至少1人）
         int undercoverCount = Math.max(1, participants.size() / 3);
+        int totalPlayers = participants.size();
 
         // 清空现有角色分配
         room.getUndercoverIds().clear();
         room.getCivilianIds().clear();
 
-        // 创建一个玩家ID列表的副本，并再次打乱，用于角色分配
-        List<Long> shuffledForRoles = new ArrayList<>(participants);
-        Collections.shuffle(shuffledForRoles);
-
-        // 分配角色 - 从打乱后的列表中选择卧底
-        for (int i = 0; i < shuffledForRoles.size(); i++) {
-            Long userId = shuffledForRoles.get(i);
-            if (i < undercoverCount) {
+        // 创建一个布尔数组来标记哪些位置分配为卧底
+        boolean[] isUndercover = new boolean[totalPlayers];
+        
+        // 使用随机数生成器
+        Random random = new Random();
+        
+        // 确保卧底分布均匀，不会连续分配
+        int assignedUndercovers = 0;
+        while (assignedUndercovers < undercoverCount) {
+            int position = random.nextInt(totalPlayers);
+            // 如果这个位置还没有分配角色，并且相邻位置没有卧底，则分配为卧底
+            if (!isUndercover[position] && !hasAdjacentUndercover(isUndercover, position, totalPlayers)) {
+                isUndercover[position] = true;
+                assignedUndercovers++;
+            }
+        }
+        
+        // 根据标记分配角色
+        for (int i = 0; i < totalPlayers; i++) {
+            Long userId = participants.get(i);
+            if (isUndercover[i]) {
                 room.getUndercoverIds().add(userId);
                 // 存储玩家角色信息
                 stringRedisTemplate.opsForValue().set(
@@ -698,7 +713,6 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                 );
 
                 // 根据游戏模式发送不同的提示信息
-
                 if (room.getGameMode() != null && room.getGameMode() == 2) {
                     String message = "你是卧底！你需要猜出平民的词语。请仔细观察其他玩家的描述，隐藏好自己的身份。";
 
@@ -708,8 +722,6 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                             .build();
                     webSocketService.sendToUid(infoResp, userId);
                 }
-
-
             } else {
                 room.getCivilianIds().add(userId);
                 // 存储玩家角色信息
@@ -726,6 +738,26 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                 webSocketService.sendToUid(infoResp, userId);
             }
         }
+    }
+    
+    /**
+     * 检查相邻位置是否有卧底，避免连续分配
+     * 
+     * @param isUndercover 标记数组
+     * @param position 当前位置
+     * @param totalPlayers 总玩家数
+     * @return 相邻位置是否有卧底
+     */
+    private boolean hasAdjacentUndercover(boolean[] isUndercover, int position, int totalPlayers) {
+        // 检查前一个位置
+        if (position > 0 && isUndercover[position - 1]) {
+            return true;
+        }
+        // 检查后一个位置
+        if (position < totalPlayers - 1 && isUndercover[position + 1]) {
+            return true;
+        }
+        return false;
     }
 
     @Override
@@ -972,6 +1004,7 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
 
                 //发送消息给每个人
                 MessageWrapper messageWrapper = getSystemMessageWrapper(gameResult);
+                messageWrapper.getMessage().setRoomId(roomId);
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.UNDERCOVER.getType())
                         .data(messageWrapper).build());
@@ -1343,7 +1376,7 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                         TimeUnit.MINUTES
                 );
                 MessageWrapper messageWrapper = getSystemMessageWrapper(loginUser.getUserName() + "用户已完成投票");
-
+                messageWrapper.getMessage().setRoomId(roomId);
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.UNDERCOVER.getType())
                         .data(messageWrapper).build());
@@ -1719,6 +1752,7 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                             "卧底" + userName + "成功猜出平民词「" + room.getCivilianWord() + "」！卧底获胜！"
                     );
 
+                    messageWrapper.getMessage().setRoomId(roomId);
                     webSocketService.sendToAllOnline(WSBaseResp.builder()
                             .type(MessageTypeEnum.UNDERCOVER.getType())
                             .data(messageWrapper).build());
@@ -1756,6 +1790,7 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                     }
 
                     MessageWrapper messageWrapper = getSystemMessageWrapper(message);
+                    messageWrapper.getMessage().setRoomId(roomId);
                     webSocketService.sendToAllOnline(WSBaseResp.builder()
                             .type(MessageTypeEnum.UNDERCOVER.getType())
                             .data(messageWrapper).build());
@@ -1883,6 +1918,8 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
                         stringRedisTemplate.delete(UndercoverGameRedisKey.getKey(UndercoverGameRedisKey.PLAYER_ROOM, loginUser.getId()));
 
                         MessageWrapper messageWrapper = getSystemMessageWrapper("谁是卧底游戏房间已关闭");
+                        messageWrapper.getMessage().setRoomId(roomId);
+
                         webSocketService.sendToAllOnline(WSBaseResp.builder()
                                 .type(MessageTypeEnum.UNDERCOVER.getType())
                                 .data(messageWrapper).build());
@@ -2052,6 +2089,8 @@ public class UndercoverGameServiceImpl implements UndercoverGameService {
 
                 // 发送退出消息
                 MessageWrapper messageWrapper = getSystemMessageWrapper(loginUser.getUserName() + "退出了谁是卧底游戏房间");
+                messageWrapper.getMessage().setRoomId(roomId);
+
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.UNDERCOVER.getType())
                         .data(messageWrapper).build());
