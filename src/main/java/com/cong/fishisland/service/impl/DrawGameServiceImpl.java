@@ -92,6 +92,11 @@ public class DrawGameServiceImpl implements DrawGameService {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "总轮数不能超过20轮");
         }
 
+        // 设置房间模式，默认为轮换模式
+        if (request.getCreatorOnlyMode() == null) {
+            request.setCreatorOnlyMode(false);
+        }
+
         // 验证是否登录
         User loginUser = userService.getLoginUser();
 
@@ -114,6 +119,7 @@ public class DrawGameServiceImpl implements DrawGameService {
             room.setRoundDuration(600);
             room.setCorrectGuessIds(new HashSet<>());
             room.setCurrentDrawerId(loginUser.getId());
+            room.setCreatorOnlyMode(request.getCreatorOnlyMode());
             // 如果自定义词语为空，从词库中随机选择一个
             try {
                 Map<String, String> wordData = getRandomWordWithHint();
@@ -143,7 +149,7 @@ public class DrawGameServiceImpl implements DrawGameService {
 
                 // 记录用户所在房间
                 stringRedisTemplate.opsForValue().set(
-                        DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, loginUser.getId()),
+                        DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, String.valueOf(loginUser.getId())),
                         roomId,
                         60,
                         TimeUnit.MINUTES
@@ -155,6 +161,9 @@ public class DrawGameServiceImpl implements DrawGameService {
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.CHAT.getType())
                         .data(messageWrapper).build());
+
+                // 更新轻量级房间列表缓存
+                updateRoomListCache();
 
                 // 通知前端刷新房间列表
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
@@ -178,6 +187,7 @@ public class DrawGameServiceImpl implements DrawGameService {
 
     /**
      * 从文件中随机获取一个词语及其提示词
+     * 确保当天已使用过的词语不会再次出现
      *
      * @return 包含词语和提示词的Map，key为"word"和"hint"
      * @throws IOException 如果读取文件失败
@@ -205,9 +215,46 @@ public class DrawGameServiceImpl implements DrawGameService {
             return defaultResult;
         }
 
+        // 获取当天已使用的词语列表
+        String today = new java.text.SimpleDateFormat("yyyy-MM-dd").format(new Date());
+        String usedWordsKey = DrawGameRedisKey.getKey(DrawGameRedisKey.USED_WORDS, today);
+        Set<String> usedWords = stringRedisTemplate.opsForSet().members(usedWordsKey);
+
+        // 如果所有词语都已使用过，则清空已使用列表
+        if (usedWords != null && usedWords.size() >= lines.size()) {
+            stringRedisTemplate.delete(usedWordsKey);
+            usedWords = new HashSet<>();
+        }
+
+        // 筛选未使用的词语
+        List<String> availableLines = new ArrayList<>();
+        for (String line : lines) {
+            String word = line.split(",")[0];
+            if (usedWords == null || !usedWords.contains(word)) {
+                availableLines.add(line);
+            }
+        }
+
+        // 如果没有可用词语，使用所有词语
+        if (availableLines.isEmpty()) {
+            availableLines = lines;
+        }
+
         // 随机选择一行
-        String selectedLine = lines.get(new Random().nextInt(lines.size()));
+        String selectedLine = availableLines.get(new Random().nextInt(availableLines.size()));
         String[] parts = selectedLine.split(",");
+
+        // 将选中的词语添加到已使用列表
+        stringRedisTemplate.opsForSet().add(usedWordsKey, parts[0]);
+        // 设置过期时间为明天凌晨00:00:00
+        Calendar tomorrow = Calendar.getInstance();
+        tomorrow.add(Calendar.DAY_OF_MONTH, 1);
+        tomorrow.set(Calendar.HOUR_OF_DAY, 0);
+        tomorrow.set(Calendar.MINUTE, 0);
+        tomorrow.set(Calendar.SECOND, 0);
+        tomorrow.set(Calendar.MILLISECOND, 0);
+        long expireSeconds = (tomorrow.getTimeInMillis() - System.currentTimeMillis()) / 1000;
+        stringRedisTemplate.expire(usedWordsKey, expireSeconds, TimeUnit.SECONDS);
 
         Map<String, String> result = new HashMap<>();
         result.put("word", parts[0]);
@@ -299,12 +346,14 @@ public class DrawGameServiceImpl implements DrawGameService {
 
                 // 记录用户所在房间
                 stringRedisTemplate.opsForValue().set(
-                        DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, loginUser.getId()),
+                        DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, String.valueOf(loginUser.getId())),
                         roomId,
                         60,
                         TimeUnit.MINUTES
                 );
 
+                // 更新轻量级房间列表缓存
+                updateRoomListCache();
 
                 // 通知前端刷新房间列表
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
@@ -323,6 +372,66 @@ public class DrawGameServiceImpl implements DrawGameService {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
+        }
+    }
+
+    /**
+     * 更新轻量级房间列表缓存
+     * 不包含绘画数据，提高查询效率
+     */
+    private void updateRoomListCache() {
+        List<DrawRoomVO> roomList = new ArrayList<>();
+
+        // 获取所有房间信息
+        Set<String> keys = stringRedisTemplate.keys(DrawGameRedisKey.BASE_KEY + "roomInfo:*");
+        if (keys.isEmpty()) {
+            // 如果没有房间，清空缓存
+            stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_LIST));
+            return;
+        }
+
+        // 遍历所有房间键，获取轻量级房间信息
+        for (String key : keys) {
+            String[] parts = key.split(":");
+            if (parts.length < 4) {
+                continue;
+            }
+            String roomId = parts[3];
+
+            // 获取房间信息，但不包含绘画数据
+            String roomJson = stringRedisTemplate.opsForValue().get(key);
+            if (roomJson != null) {
+                try {
+                    DrawRoom room = objectMapper.readValue(roomJson, DrawRoom.class);
+                    DrawRoomVO roomVO = convertRoomToVO(room, roomId);
+                    // 不设置绘画数据
+                    roomVO.setDrawData(null);
+                    roomList.add(roomVO);
+                } catch (JsonProcessingException e) {
+                    log.error("解析房间信息失败", e);
+                }
+            }
+        }
+
+        // 按创建时间降序排序
+        roomList.sort((r1, r2) -> {
+            if (r1.getCreateTime() == null || r2.getCreateTime() == null) {
+                return 0;
+            }
+            return r2.getCreateTime().compareTo(r1.getCreateTime());
+        });
+
+        // 缓存轻量级房间列表
+        try {
+            String roomListJson = objectMapper.writeValueAsString(roomList);
+            stringRedisTemplate.opsForValue().set(
+                    DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_LIST),
+                    roomListJson,
+                    30, // 缓存30秒
+                    TimeUnit.SECONDS
+            );
+        } catch (JsonProcessingException e) {
+            log.error("序列化房间列表失败", e);
         }
     }
 
@@ -353,8 +462,7 @@ public class DrawGameServiceImpl implements DrawGameService {
             if (StpUtil.isLogin()) {
                 User currentUser = userService.getLoginUser();
                 // 检查当前用户是否有权限看到词语
-                if (currentUser.getId().equals(room.getCreatorId()) ||
-                        currentUser.getId().equals(room.getCurrentDrawerId())) {
+                if (currentUser.getId().equals(room.getCurrentDrawerId())) {
                     roomVO.setCurrentWord(room.getCurrentWord());
                 } else {
                     // 对非绘画者隐藏词语
@@ -374,42 +482,34 @@ public class DrawGameServiceImpl implements DrawGameService {
 
     @Override
     public List<DrawRoomVO> getAllRooms() {
-        List<DrawRoomVO> roomList = new ArrayList<>();
-
-        // 获取所有以 "fish:draw:roomInfo:" 开头的键
-        Set<String> keys = stringRedisTemplate.keys(DrawGameRedisKey.BASE_KEY + "roomInfo:*");
-        if (keys.isEmpty()) {
-            return roomList;
-        }
-
-        // 遍历所有房间键，获取房间信息
-        for (String key : keys) {
-            // 从键中提取房间ID
-            // 格式为 "fish:draw:roomInfo:{roomId}"，需要提取最后一部分作为roomId
-            String[] parts = key.split(":");
-            if (parts.length < 4) {
-                continue;
-            }
-            String roomId = parts[3];
-
-            // 获取房间信息
-            DrawRoomVO roomVO = getRoomById(roomId);
-            if (roomVO != null) {
-                // 对房间列表不返回绘画数据，节省带宽
-                roomVO.setDrawData(null);
-                roomList.add(roomVO);
+        // 直接从轻量级房间列表缓存中获取数据
+        String roomListJson = stringRedisTemplate.opsForValue().get(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_LIST));
+        if (roomListJson != null) {
+            try {
+                return objectMapper.readValue(roomListJson, new TypeReference<List<DrawRoomVO>>() {
+                });
+            } catch (JsonProcessingException e) {
+                log.error("解析房间列表失败", e);
+                // 解析失败，继续使用原有方式获取
             }
         }
 
-        // 按创建时间降序排序，最新创建的房间排在前面
-        roomList.sort((r1, r2) -> {
-            if (r1.getCreateTime() == null || r2.getCreateTime() == null) {
-                return 0;
-            }
-            return r2.getCreateTime().compareTo(r1.getCreateTime());
-        });
+        // 如果缓存不存在，则更新并获取缓存
+        updateRoomListCache();
 
-        return roomList;
+        // 再次尝试从缓存获取
+        roomListJson = stringRedisTemplate.opsForValue().get(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_LIST));
+        if (roomListJson != null) {
+            try {
+                return objectMapper.readValue(roomListJson, new TypeReference<List<DrawRoomVO>>() {
+                });
+            } catch (JsonProcessingException e) {
+                log.error("解析房间列表失败", e);
+            }
+        }
+
+        // 如果仍然失败，返回空列表
+        return new ArrayList<>();
     }
 
     /**
@@ -475,6 +575,9 @@ public class DrawGameServiceImpl implements DrawGameService {
                 .collect(Collectors.toList());
         roomVO.setCorrectGuessPlayers(correctGuessPlayers);
 
+        // 设置房间模式
+        roomVO.setCreatorOnlyMode(room.getCreatorOnlyMode());
+
         return roomVO;
     }
 
@@ -537,10 +640,20 @@ public class DrawGameServiceImpl implements DrawGameService {
                         TimeUnit.MINUTES
                 );
 
+
                 // 通知前端刷新绘画数据
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.REFRESH_DRAW.getType())
                         .data(roomId).build());
+
+                //发送提示
+                String message = "绘画者【"+loginUser.getUserName() + "】绘画完成大家快来猜猜是什么";
+                MessageWrapper messageWrapper = getSystemMessageWrapper(message);
+                messageWrapper.getMessage().setRoomId(roomId);
+
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.DRAW.getType())
+                        .data(messageWrapper).build());
 
                 return true;
             } catch (JsonProcessingException e) {
@@ -603,25 +716,45 @@ public class DrawGameServiceImpl implements DrawGameService {
                     throw new BusinessException(ErrorCode.OPERATION_ERROR, "用户不在房间中");
                 }
 
-                // 检查用户是否是当前绘画者，绘画者不能猜词
-                if (loginUser.getId().equals(room.getCurrentDrawerId())) {
-                    // 判断猜词是否正确
-                    boolean isCorrect = guessWord.trim().equalsIgnoreCase(room.getCurrentWord().trim());
-
+                // 检查绘画数据是否为空
+                String drawData = stringRedisTemplate.opsForValue().get(
+                        DrawGameRedisKey.getKey(DrawGameRedisKey.DRAW_DATA, roomId));
+                if (StringUtils.isBlank(drawData) && !loginUser.getId().equals(room.getCreatorId())) {
                     MessageWrapper userMessage = request.getMessageWrapper();
-                    if (isCorrect) {
-                        userMessage.getMessage().setContent("***");
-                    }
+
+                    String contentWord = userMessage.getMessage().getContent();
+
+                    userMessage.getMessage().setContent(contentWord);
+
+                    userMessage.getMessage().setRoomId(roomId);
+                    webSocketService.sendToAllOnline(WSBaseResp.builder()
+                            .type(MessageTypeEnum.DRAW.getType())
+                            .data(userMessage).build(), loginUser.getId());
+
+                    //发送提示
+                    String message = loginUser.getUserName() + "【绘画用户绘画中，请等下再猜喔】";
+                    MessageWrapper messageWrapper = getSystemMessageWrapper(message);
+                    messageWrapper.getMessage().setRoomId(roomId);
+
+                    webSocketService.sendToAllOnline(WSBaseResp.builder()
+                            .type(MessageTypeEnum.DRAW.getType())
+                            .data(messageWrapper).build());
+                    return null;
+                }
+
+                // 检查用户是否是当前绘画者，绘画者不能猜词
+                if (loginUser.getId().equals(room.getCurrentDrawerId()) || room.getCorrectGuessIds().contains(loginUser.getId())) {
+                    MessageWrapper userMessage = request.getMessageWrapper();
+
+                    String contentWord = userMessage.getMessage().getContent()
+                            .replace(room.getCurrentWord(), "***");
+                    userMessage.getMessage().setContent(contentWord);
+
                     userMessage.getMessage().setRoomId(roomId);
                     webSocketService.sendToAllOnline(WSBaseResp.builder()
                             .type(MessageTypeEnum.DRAW.getType())
                             .data(userMessage).build(), loginUser.getId());
                     return null;
-                }
-
-                // 检查用户是否已经猜中
-                if (room.getCorrectGuessIds().contains(loginUser.getId())) {
-                    throw new BusinessException(ErrorCode.OPERATION_ERROR, "您已经猜中，无需再猜");
                 }
 
                 // 创建猜词记录
@@ -665,18 +798,38 @@ public class DrawGameServiceImpl implements DrawGameService {
                 if (isCorrect) {
                     room.getCorrectGuessIds().add(loginUser.getId());
 
-                    // 增加用户积分
+                    // 根据猜中顺序计算积分
+                    int correctGuessCount = room.getCorrectGuessIds().size();
+                    int score = 0;
+
+                    // 第一个猜出5分，第二个4分，第三个3分，第四个及之后都是2分，最后一名1分
+                    if (correctGuessCount == 1) {
+                        score = 5;
+                    } else if (correctGuessCount == 2) {
+                        score = 4;
+                    } else if (correctGuessCount == 3) {
+                        score = 3;
+                    } else {
+                        score = 2;
+                    }
+
+                    // 如果是最后一个人猜中（所有人都猜中了），给1分
+                    // -1是因为排除绘画者
+                    if (correctGuessCount == room.getParticipantIds().size() - 1) {
+                        score = 1;
+                    }
+
                     // 从Redis中获取玩家积分信息
                     String playerScoreKey = DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_SCORE, roomId, loginUser.getId().toString());
                     String scoreStr = stringRedisTemplate.opsForValue().get(playerScoreKey);
-                    int score = 0;
+                    int currentScore = 0;
                     if (scoreStr != null) {
-                        score = Integer.parseInt(scoreStr);
+                        currentScore = Integer.parseInt(scoreStr);
                     }
-                    // 猜中积分加1
-                    score += 1;
+                    // 更新积分
+                    currentScore += score;
                     // 保存更新后的积分
-                    stringRedisTemplate.opsForValue().set(playerScoreKey, String.valueOf(score), 60, TimeUnit.MINUTES);
+                    stringRedisTemplate.opsForValue().set(playerScoreKey, String.valueOf(currentScore), 60, TimeUnit.MINUTES);
 
                     // 更新房间信息
                     String updatedRoomJson = objectMapper.writeValueAsString(room);
@@ -688,12 +841,39 @@ public class DrawGameServiceImpl implements DrawGameService {
                     );
 
                     // 发送猜中消息
-                    MessageWrapper messageWrapper = getSystemMessageWrapper("恭喜 " + loginUser.getUserName() + " 猜中了词语积分 +1");
+                    MessageWrapper messageWrapper = getSystemMessageWrapper("恭喜 " + loginUser.getUserName() + " 猜中了词语，获得 " + score + " 分！");
                     messageWrapper.getMessage().setRoomId(roomId);
 
                     webSocketService.sendToAllOnline(WSBaseResp.builder()
                             .type(MessageTypeEnum.DRAW.getType())
                             .data(messageWrapper).build());
+
+                    // 如果是第一个猜中的人，给绘画者加2分
+                    if (correctGuessCount == 1) {
+                        // 获取绘画者积分
+                        String drawerScoreKey = DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_SCORE, roomId, room.getCurrentDrawerId().toString());
+                        String drawerScoreStr = stringRedisTemplate.opsForValue().get(drawerScoreKey);
+                        int drawerScore = 0;
+                        if (drawerScoreStr != null) {
+                            drawerScore = Integer.parseInt(drawerScoreStr);
+                        }
+                        // 绘画者加2分
+                        drawerScore += 2;
+                        // 保存更新后的积分
+                        stringRedisTemplate.opsForValue().set(drawerScoreKey, String.valueOf(drawerScore), 60, TimeUnit.MINUTES);
+
+                        // 获取绘画者信息
+                        User drawer = userService.getById(room.getCurrentDrawerId());
+                        String drawerName = drawer != null ? drawer.getUserName() : "绘画者";
+
+                        // 发送绘画者加分消息
+                        MessageWrapper drawerScoreMessage = getSystemMessageWrapper(drawerName + " 作为绘画者获得 2 分！");
+                        drawerScoreMessage.getMessage().setRoomId(roomId);
+
+                        webSocketService.sendToAllOnline(WSBaseResp.builder()
+                                .type(MessageTypeEnum.DRAW.getType())
+                                .data(drawerScoreMessage).build());
+                    }
 
                 } else {
                     // 猜错了，发送提示
@@ -784,7 +964,7 @@ public class DrawGameServiceImpl implements DrawGameService {
 
                 // 检查房间状态
                 if (room.getStatus() != RoomStatusEnum.WAITING) {
-                    throw new BusinessException(ErrorCode.OPERATION_ERROR, "房间已开始或已结束");
+                    throw new BusinessException(ErrorCode.OPERATION_ERROR, "房间已结束无法观战");
                 }
 
                 // 检查参与者数量
@@ -799,9 +979,15 @@ public class DrawGameServiceImpl implements DrawGameService {
                 room.setCorrectGuessIds(new HashSet<>());
                 room.setCurrentRound(1);
 
-                // 如果当前绘画者为空，默认设置为房主
-                if (room.getCurrentDrawerId() == null) {
+                // 根据房间模式设置绘画者
+                if (Boolean.TRUE.equals(room.getCreatorOnlyMode())) {
+                    // 房主绘画模式，绘画者始终为房主
                     room.setCurrentDrawerId(room.getCreatorId());
+                } else {
+                    // 轮换模式，如果当前绘画者为空，默认设置为房主
+                    if (room.getCurrentDrawerId() == null) {
+                        room.setCurrentDrawerId(room.getCreatorId());
+                    }
                 }
 
                 // 更新房间信息
@@ -818,6 +1004,11 @@ public class DrawGameServiceImpl implements DrawGameService {
 
                 // 清空猜词记录
                 stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_GUESSES, roomId));
+
+                // 发送清空画板通知
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.CLEAR_DRAW.getType())
+                        .data(roomId).build());
 
                 // 发送游戏开始消息
                 MessageWrapper messageWrapper = getSystemMessageWrapper("你画我猜游戏开始啦！房主需要根据提示词进行绘画，其他玩家猜词。提示类别：" + room.getWordHint());
@@ -842,6 +1033,13 @@ public class DrawGameServiceImpl implements DrawGameService {
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
                         .type(MessageTypeEnum.DRAW.getType())
                         .data(nextRoundMessage).build());
+
+                // 发送当前绘画者提示
+                MessageWrapper drawerInfoMessage = getSystemMessageWrapper("当前绘画者是：" + drawerName);
+                drawerInfoMessage.getMessage().setRoomId(roomId);
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.DRAW.getType())
+                        .data(drawerInfoMessage).build());
 
                 // 通知前端刷新房间状态
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
@@ -918,6 +1116,11 @@ public class DrawGameServiceImpl implements DrawGameService {
                         TimeUnit.MINUTES
                 );
 
+                // 发送清空画板通知
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.CLEAR_DRAW.getType())
+                        .data(roomId).build());
+
                 // 发送游戏结束消息
                 MessageWrapper messageWrapper = getSystemMessageWrapper("你画我猜游戏结束！本轮的提示词是「" + room.getCurrentWord() + "」，类别是「" + room.getWordHint() + "」");
                 messageWrapper.getMessage().setRoomId(roomId);
@@ -969,7 +1172,7 @@ public class DrawGameServiceImpl implements DrawGameService {
                     DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_INFO, roomId));
             if (roomJson == null) {
                 // 房间不存在，直接删除用户所在房间记录
-                stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, loginUser.getId()));
+                stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, String.valueOf(loginUser.getId())));
                 return true;
             }
 
@@ -1052,6 +1255,9 @@ public class DrawGameServiceImpl implements DrawGameService {
                     stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_INFO, roomId));
                     stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.DRAW_DATA, roomId));
                     stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_GUESSES, roomId));
+
+                    // 更新轻量级房间列表缓存
+                    updateRoomListCache();
                 } else {
                     // 更新房间信息
                     String updatedRoomJson = objectMapper.writeValueAsString(room);
@@ -1064,7 +1270,10 @@ public class DrawGameServiceImpl implements DrawGameService {
                 }
 
                 // 删除用户所在房间记录
-                stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, loginUser.getId()));
+                stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, String.valueOf(loginUser.getId())));
+
+                // 更新轻量级房间列表缓存
+                updateRoomListCache();
 
                 // 发送退出消息
                 MessageWrapper quitMessage = getSystemMessageWrapper(loginUser.getUserName() + "退出了你画我猜游戏房间");
@@ -1140,9 +1349,12 @@ public class DrawGameServiceImpl implements DrawGameService {
                 stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.DRAW_DATA, roomId));
                 stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_GUESSES, roomId));
 
+                // 更新轻量级房间列表缓存
+                updateRoomListCache();
+
                 // 删除所有玩家的房间关联信息
                 for (Long playerId : room.getParticipantIds()) {
-                    stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, playerId));
+                    stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.PLAYER_ROOM, String.valueOf(playerId)));
                 }
 
                 // 通知前端刷新房间列表
@@ -1197,7 +1409,7 @@ public class DrawGameServiceImpl implements DrawGameService {
                 boolean isCreator = loginUser.getId().equals(room.getCreatorId());
                 boolean isAdmin = UserConstant.ADMIN_ROLE.equals(loginUser.getUserRole());
 
-                if (!isCreator && !isAdmin) {
+                if (!isCreator && !isAdmin && !loginUser.getId().equals(room.getCurrentDrawerId())) {
                     throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "只有房主或管理员可以进入下一轮");
                 }
 
@@ -1283,14 +1495,24 @@ public class DrawGameServiceImpl implements DrawGameService {
                 // 重置正确猜词列表
                 room.setCorrectGuessIds(new HashSet<>());
 
-                // 选择下一个绘画者（简单实现：从参与者中选择一个不是当前绘画者的用户）
-                Long nextDrawerId = null;
-//                for (Long playerId : room.getParticipantIds()) {
-//                    if (!playerId.equals(room.getCurrentDrawerId())) {
-//                        nextDrawerId = playerId;
-//                        break;
-//                    }
-//                }
+                // 选择下一个绘画者，根据房间模式决定
+                Long nextDrawerId;
+
+                // 如果是房主绘画模式，绘画者始终为房主
+                if (Boolean.TRUE.equals(room.getCreatorOnlyMode())) {
+                    nextDrawerId = room.getCreatorId();
+                } else {
+                    // 轮换模式，按顺序选择下一个绘画者
+                    List<Long> participantList = new ArrayList<>(room.getParticipantIds());
+                    // 按用户ID排序，保证顺序一致
+                    Collections.sort(participantList);
+
+                    // 找到当前绘画者在列表中的位置
+                    int currentIndex = participantList.indexOf(room.getCurrentDrawerId());
+                    // 选择下一个绘画者（如果当前是最后一个，则选择第一个）
+                    int nextIndex = (currentIndex + 1) % participantList.size();
+                    nextDrawerId = participantList.get(nextIndex);
+                }
 
                 // 如果没有找到下一个绘画者（可能只有一个玩家），则使用当前绘画者
                 if (nextDrawerId == null) {
@@ -1326,6 +1548,11 @@ public class DrawGameServiceImpl implements DrawGameService {
                 // 清空猜词记录
                 stringRedisTemplate.delete(DrawGameRedisKey.getKey(DrawGameRedisKey.ROOM_GUESSES, roomId));
 
+                // 发送清空画板通知
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.CLEAR_DRAW.getType())
+                        .data(roomId).build());
+
                 // 发送下一轮开始消息
                 User drawer = userService.getById(nextDrawerId);
                 String drawerName = drawer != null ? drawer.getUserName() : "绘画者";
@@ -1342,6 +1569,13 @@ public class DrawGameServiceImpl implements DrawGameService {
                         .type(MessageTypeEnum.INFO.getType())
                         .data(wordMessage)
                         .build(), nextDrawerId);
+
+                // 发送当前绘画者提示
+                MessageWrapper drawerInfoMessage = getSystemMessageWrapper("当前绘画者是：" + drawerName);
+                drawerInfoMessage.getMessage().setRoomId(roomId);
+                webSocketService.sendToAllOnline(WSBaseResp.builder()
+                        .type(MessageTypeEnum.DRAW.getType())
+                        .data(drawerInfoMessage).build());
 
                 // 通知前端刷新房间状态
                 webSocketService.sendToAllOnline(WSBaseResp.builder()
@@ -1362,4 +1596,4 @@ public class DrawGameServiceImpl implements DrawGameService {
             }
         }
     }
-} 
+}
