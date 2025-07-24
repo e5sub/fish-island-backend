@@ -23,7 +23,6 @@ spring:
           ssl:
             enable: true  # 启用 SSL
     default-encoding: UTF-8  # 编码格式
-
     password: jtwdpsvnfsqqdihd
   # Elasticsearch 配置
   # todo 需替换配置，然后取消注释
