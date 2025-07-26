@@ -40,9 +40,14 @@ public class LoginUserVO implements Serializable {
     private  String email;
 
     /**
-     * 用户角色：user/admin/ban
+     * 用户角色：user/admin/ban/vip
      */
     private String userRole;
+
+    /**
+     * 是否是 VIP 用户
+     */
+    private boolean isVip;
 
     /**
      * 创建时间
