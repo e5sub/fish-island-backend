@@ -333,12 +333,12 @@ CREATE TABLE if not exists `user_vip`
 (
     `id`         BIGINT AUTO_INCREMENT COMMENT '会员ID',
     `userId`     BIGINT COMMENT '用户ID',
-    `cardNo`     VARCHAR(256)  NULL COMMENT '会员兑换卡号（永久会员无卡号）',
-    `type`       tinyint           default 1 not null comment '1-月卡会员 2-永久会员',
-    `validDays`  DATETIME          default null comment '会员到期时间，永久会员为null',
-    `isDelete`   tinyint           default 0 not null comment '是否删除',
-    `createTime` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    `updateTime` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `cardNo`     VARCHAR(256) NULL COMMENT '会员兑换卡号（永久会员无卡号）',
+    `type`       tinyint               default 1 not null comment '1-月卡会员 2-永久会员',
+    `validDays`  DATETIME              default null comment '会员到期时间，永久会员为null',
+    `isDelete`   tinyint               default 0 not null comment '是否删除',
+    `createTime` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updateTime` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
     -- 索引
     INDEX `idx_donor` (`userId`)
@@ -346,4 +346,59 @@ CREATE TABLE if not exists `user_vip`
   DEFAULT CHARSET = utf8mb4
   COLLATE = utf8mb4_unicode_ci COMMENT ='用户会员表';
 
+-- 词库表
+create table if not exists word_library
+(
+    id         BIGINT AUTO_INCREMENT COMMENT '词库ID' primary key,
+    word       VARCHAR(100)                       NOT NULL COMMENT '词语名称',
+    category   VARCHAR(50)                        NOT NULL COMMENT '词库分类: undercover-谁是卧底, draw-default-你画我猜默认, draw-hero-你画我猜王者荣耀, draw-idiom-你画我猜成语',
+    wordType   VARCHAR(50)                        COMMENT '词语类型（如：水果、动物、王者英雄、成语等）',
+    createTime datetime default CURRENT_TIMESTAMP not null comment '创建时间',
+    updateTime datetime default CURRENT_TIMESTAMP not null on update CURRENT_TIMESTAMP comment '更新时间'
+) COMMENT '词库表' collate = utf8mb4_unicode_ci;
+
+
+-- 道具表
+create table if not exists props
+(
+    frameId     BIGINT auto_increment comment '道具 ID' PRIMARY KEY,
+    imgUrl      VARCHAR(256) comment '道具图片地址',
+    type        VARCHAR(256) comment '道具类型 1-摸鱼会员月卡 2-摸鱼称号 ',
+    description VARCHAR(256) comment '道具描述',
+    name        VARCHAR(256) comment '道具名称',
+    points      INT      DEFAULT 1 comment '道具所需兑换积分',
+    createTime  datetime default CURRENT_TIMESTAMP not null comment '创建时间',
+    updateTime  datetime default CURRENT_TIMESTAMP not null on update CURRENT_TIMESTAMP comment '更新时间',
+    isDelete    tinyint  default 0                 not null comment '是否删除'
+) comment '道具表' collate = utf8mb4_unicode_ci;
+
+
+create table if not exists fish_pet
+(
+    petId        BIGINT auto_increment comment '宠物 ID' PRIMARY KEY,
+    petUrl       VARCHAR(256) comment '宠物图片地址',
+    name         VARCHAR(256) comment '宠物名称',
+    userId       BIGINT comment '用户 ID',
+    level        INT default 1 comment '宠物等级',
+    exp          INT default 0 comment '当前经验值',
+    mood         INT default 100 comment '宠物心情值（0-100）',
+    hunger       INT default 0 comment '积饿度（越高越饿，建议范围 0-100）',
+    extendData   VARCHAR(1024) comment '宠物扩展数据（技能、形象等，JSON 格式）',
+    createTime   DATETIME default CURRENT_TIMESTAMP not null comment '创建时间',
+    updateTime   DATETIME default CURRENT_TIMESTAMP not null on update CURRENT_TIMESTAMP comment '更新时间',
+    isDelete     TINYINT default 0 not null comment '是否删除'
+) comment '摸鱼宠物表' collate = utf8mb4_unicode_ci;
+
+-- 宠物皮肤表
+create table if not exists pet_skin
+(
+    skinId    BIGINT auto_increment comment '皮肤 ID' PRIMARY KEY,
+    url        VARCHAR(256) comment '皮肤地址',
+    description        VARCHAR(256) comment '皮肤描述',
+    name       VARCHAR(256) comment '皮肤名称',
+    points     INT      DEFAULT 1 comment '皮肤所需兑换积分',
+    createTime datetime default CURRENT_TIMESTAMP not null comment '创建时间',
+    updateTime datetime default CURRENT_TIMESTAMP not null on update CURRENT_TIMESTAMP comment '更新时间',
+    isDelete   tinyint  default 0                 not null comment '是否删除'
+) comment '宠物皮肤表' collate = utf8mb4_unicode_ci;
 
