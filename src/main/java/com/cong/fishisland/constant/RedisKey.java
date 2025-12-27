@@ -61,6 +61,36 @@ public interface RedisKey {
     
     String NO_REPEAT_SUBMIT_PREFIX = "noRepeatSubmit:%s:%s";
 
+    /**
+     * 用户年度报告内容摘要缓存 annual:report:content:summary:{userId}:{year}
+     */
+    String ANNUAL_REPORT_CONTENT_SUMMARY = "annual:report:content:summary:%d:%d";
+
+    /**
+     * Boss列表缓存
+     */
+    String BOSS_LIST_CACHE_KEY = "boss:list";
+
+    /**
+     * Boss当前血量缓存 boss:health:{bossId}
+     */
+    String BOSS_HEALTH_CACHE_KEY = "boss:health:%d";
+
+    /**
+     * 用户每日Boss挑战记录 boss:battle:user:{userId}:boss:{bossId}:{date}
+     */
+    String BOSS_BATTLE_USER_DAILY_KEY = "boss:battle:user:%d:boss:%d:%s";
+
+    /**
+     * Boss挑战排行榜 boss:ranking:{bossId}
+     */
+    String BOSS_CHALLENGE_RANKING_KEY = "boss:ranking:%d";
+
+    /**
+     * 帖子中奖用户缓存 post:reward:{postId}:{yyyyMMdd}
+     */
+    String POST_REWARD_USER_KEY = "post:reward:%d:%s";
+
     static String getKey(String key, Object... objects) {
         return BASE_KEY + String.format(key, objects);
     }
