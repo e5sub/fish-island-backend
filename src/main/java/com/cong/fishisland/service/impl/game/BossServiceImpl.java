@@ -4,6 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.cong.fishisland.common.ErrorCode;
 import com.cong.fishisland.common.exception.BusinessException;
 import com.cong.fishisland.constant.RedisKey;
+import com.cong.fishisland.mapper.game.BossMapper;
+import com.cong.fishisland.model.entity.game.Boss;
 import com.cong.fishisland.model.entity.pet.FishPet;
 import com.cong.fishisland.model.entity.user.User;
 import com.cong.fishisland.model.vo.game.AttackResultVO;
@@ -11,8 +13,10 @@ import com.cong.fishisland.model.vo.game.BattleResultVO;
 import com.cong.fishisland.model.vo.game.BossBattleInfoVO;
 import com.cong.fishisland.model.vo.game.BossChallengeRankingVO;
 import com.cong.fishisland.model.vo.game.BossVO;
+import com.cong.fishisland.model.vo.pet.PetEquipStatsVO;
 import com.cong.fishisland.service.BossService;
 import com.cong.fishisland.service.FishPetService;
+import com.cong.fishisland.service.UserPointsService;
 import com.cong.fishisland.service.UserService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -45,58 +49,59 @@ public class BossServiceImpl implements BossService {
 
     private final UserService userService;
     private final FishPetService fishPetService;
+    private final UserPointsService userPointsService;
     private final StringRedisTemplate redisTemplate;
+    private final BossMapper bossMapper;
     private final Random random = new Random();
 
     // Boss血量缓存过期时间（24小时）
     private static final long BOSS_HEALTH_CACHE_EXPIRE_HOURS = 24;
 
-    // 暴击概率（20%）
-    private static final double CRITICAL_RATE = 0.2;
-    // 闪避概率（15%）
-    private static final double DODGE_RATE = 0.15;
-    // 连击概率（10%）
-    private static final double COMBO_RATE = 0.1;
+    // 每天最大挑战次数
+    private static final int MAX_DAILY_CHALLENGES = 2;
+
     // 暴击伤害倍数
     private static final double CRITICAL_DAMAGE_MULTIPLIER = 2.0;
     // 连击伤害倍数
     private static final double COMBO_DAMAGE_MULTIPLIER = 1.5;
 
+    // Boss击败积分分配百分比（按排名）
+    // 第1名: 20%, 第2名: 15%, 第3名: 10%, 第4-5名: 各8%, 第6-10名: 各5%
+    private static final double[] BOSS_REWARD_PERCENTAGES = {0.20, 0.15, 0.10, 0.08, 0.08, 0.05, 0.05, 0.05, 0.05, 0.05};
+    
+    // 其他参与者的奖励比例
+    private static final double OTHER_PARTICIPANTS_REWARD_PERCENTAGE = 0.02;
+
     @Override
     public List<BossVO> getBossList() {
-        List<BossVO> bossList = new ArrayList<>();
-
-        // Boss 1: 邪恶总监 (800积分)
-        BossVO boss1 = new BossVO();
-        boss1.setId(1L);
-        boss1.setName("邪恶总监");
-        boss1.setAvatar("https://img0.baidu.com/it/u=3023752464,2240102315&fm=253&fmt=auto&app=138&f=JPEG?w=500&h=500");
-        boss1.setHealth(8000);
-        boss1.setRewardPoints(800);
-        boss1.setAttack(400);
-        bossList.add(boss1);
-
-        // Boss 2: 996领导 (900积分)
-        BossVO boss2 = new BossVO();
-        boss2.setId(2L);
-        boss2.setName("996领导");
-        boss2.setAvatar("https://img2.baidu.com/it/u=4291858461,3385772735&fm=253&fmt=auto&app=138&f=JPEG?w=500&h=503");
-        boss2.setHealth(9000);
-        boss2.setRewardPoints(900);
-        boss2.setAttack(450);
-        bossList.add(boss2);
-
-        // Boss 3: 集齐迈巴赫碎片老板 (1000积分)
-        BossVO boss3 = new BossVO();
-        boss3.setId(3L);
-        boss3.setName("集齐迈巴赫碎片老板");
-        boss3.setAvatar("https://img2.baidu.com/it/u=285303210,4203227947&fm=253&fmt=auto&app=138&f=JPEG?w=800&h=800");
-        boss3.setHealth(10000);
-        boss3.setRewardPoints(1000);
-        boss3.setAttack(500);
-        bossList.add(boss3);
-
-        return bossList;
+        // 从数据库查询所有启用的Boss
+        QueryWrapper<Boss> queryWrapper = new QueryWrapper<>();
+        queryWrapper.eq("status", 1).eq("isDelete", 0).orderByAsc("sort");
+        List<Boss> bossList = bossMapper.selectList(queryWrapper);
+        
+        // 转换为BossVO
+        return bossList.stream().map(boss -> {
+            BossVO vo = new BossVO();
+            vo.setId(boss.getId());
+            vo.setName(boss.getName());
+            vo.setAvatar(boss.getAvatar());
+            vo.setHealth(boss.getHealth());
+            vo.setAttack(boss.getAttack());
+            vo.setRewardPoints(boss.getRewardPoints());
+            // 主动属性
+            vo.setCritRate(boss.getCritRate());
+            vo.setComboRate(boss.getComboRate());
+            vo.setDodgeRate(boss.getDodgeRate());
+            vo.setBlockRate(boss.getBlockRate());
+            vo.setLifesteal(boss.getLifesteal());
+            // 抗性属性
+            vo.setCritResistance(boss.getCritResistance());
+            vo.setComboResistance(boss.getComboResistance());
+            vo.setDodgeResistance(boss.getDodgeResistance());
+            vo.setBlockResistance(boss.getBlockResistance());
+            vo.setLifestealResistance(boss.getLifestealResistance());
+            return vo;
+        }).collect(Collectors.toList());
     }
 
     @Override
@@ -109,9 +114,10 @@ public class BossServiceImpl implements BossService {
         // 获取当前登录用户
         Long userId = userService.getLoginUser().getId();
 
-        // 检查用户今天是否已经打过这个Boss
-        if (hasUserBattledToday(userId, bossId)) {
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "您今天已经挑战过这个Boss了，请明天再来");
+        // 检查用户今天是否已达到挑战次数上限
+        int remainingChallenges = getRemainingDailyChallenges(userId, bossId);
+        if (remainingChallenges <= 0) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "您今天已用完"+MAX_DAILY_CHALLENGES+"次挑战机会，请明天再来");
         }
 
         // 获取用户的宠物
@@ -128,16 +134,36 @@ public class BossServiceImpl implements BossService {
             throw new BusinessException(ErrorCode.NOT_FOUND_ERROR, "Boss不存在");
         }
 
+        // 从Redis获取Boss当前血量，检查是否已被击败
+        int currentBossHealth = getBossHealthFromRedis(bossId, boss.getHealth());
+        if (currentBossHealth <= 0) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "该Boss已被击败，请明天再来挑战");
+        }
+
         // 计算宠物的攻击力和血量
         int petLevel = pet.getLevel() != null ? pet.getLevel() : 1;
-        int petAttack = petLevel;  // 攻击力等于等级
-        int petHealth = petLevel * 100;
+        
+        // 获取用户的宠物装备属性
+        PetEquipStatsVO petEquipStats = fishPetService.getPetEquipStats();
+        int equipAttack = petEquipStats != null && petEquipStats.getTotalBaseAttack() != null 
+                ? petEquipStats.getTotalBaseAttack() : 0;
+        int equipDefense = petEquipStats != null && petEquipStats.getTotalBaseDefense() != null 
+                ? petEquipStats.getTotalBaseDefense() : 0;
+        int equipHp = petEquipStats != null && petEquipStats.getTotalBaseHp() != null 
+                ? petEquipStats.getTotalBaseHp() : 0;
+        double petCritRate = petEquipStats != null ? petEquipStats.getCritRate() : 0.0;
+        double petComboRate = petEquipStats != null ? petEquipStats.getComboRate() : 0.0;
+        double petDodgeRate = petEquipStats != null ? petEquipStats.getDodgeRate() : 0.0;
+        
+        // 攻击力 = 等级 + 装备攻击力
+        int petAttack = petLevel + equipAttack;
+        // 血量 = 等级 * 100 + 装备生命值
+        int petHealth = petLevel * 100 + equipHp;
+        // 防御力 = 装备防御力（用于减伤）
+        int petDefense = equipDefense;
 
         // 初始化血量（宠物每次对战都是满血开始）
         int currentPetHealth = petHealth;
-        
-        // 从Redis获取Boss当前血量，如果不存在则使用初始血量
-        int currentBossHealth = getBossHealthFromRedis(bossId, boss.getHealth());
 
         // 创建对战结果列表
         List<BattleResultVO> battleResults = new ArrayList<>();
@@ -155,8 +181,8 @@ public class BossServiceImpl implements BossService {
         // 为防止极端情况下无限连击导致死循环，增加一个最大行动次数保护
         int maxActions = 100;
 
-        // 宠物和Boss各自最多出手5回合（连击不算回合）
-        while ((petRounds < 5 || bossRounds < 5)
+        // 宠物和Boss各自最多出手 20回合（连击不算回合）
+        while ((petRounds < 20 || bossRounds < 20)
                 && currentPetHealth > 0
                 && currentBossHealth > 0
                 && maxActions-- > 0) {
@@ -175,8 +201,9 @@ public class BossServiceImpl implements BossService {
             boolean isCombo;
 
             if (petTurn) {
-                // 宠物攻击Boss
-                AttackResultVO attackResult = performAttack(petAttack, currentBossHealth);
+                // 宠物攻击Boss - 使用宠物装备属性
+                AttackResultVO attackResult = performAttack(petAttack, currentBossHealth,
+                        petCritRate, petComboRate, 0.0); // Boss没有闪避率
                 damage = attackResult.getDamage();
                 isDodge = attackResult.isDodge();
                 isCritical = attackResult.isCritical();
@@ -187,8 +214,9 @@ public class BossServiceImpl implements BossService {
                     totalDamage += damage;
                 }
             } else {
-                // Boss攻击宠物
-                AttackResultVO attackResult = performAttack(boss.getAttack(), currentPetHealth);
+                // Boss攻击宠物 - 使用宠物闪避属性和防御力减伤
+                AttackResultVO attackResult = performAttack(boss.getAttack(), currentPetHealth,
+                        0.0, 0.0, petDodgeRate, petDefense); // Boss没有暴击和连击，宠物有防御
                 damage = attackResult.getDamage();
                 isDodge = attackResult.isDodge();
                 isCritical = attackResult.isCritical();
@@ -225,8 +253,8 @@ public class BossServiceImpl implements BossService {
             }
         }
 
-        // 标记用户今天已挑战过这个Boss
-        markUserBattledToday(userId, bossId);
+        // 增加用户今天挑战次数
+        incrementDailyChallengeCount(userId, bossId);
 
         // 将用户造成的伤害存入排行榜
         updateBossChallengeRanking(bossId, userId, totalDamage);
@@ -239,24 +267,29 @@ public class BossServiceImpl implements BossService {
      *
      * @param attackPower 攻击力
      * @param targetHealth 目标当前血量
+     * @param critRate 暴击概率
+     * @param comboRate 连击概率
+     * @param dodgeRate 闪避概率
+     * @param defense 防御力（仅用于受到攻击时减伤）
      * @return 攻击结果
      */
-    private AttackResultVO performAttack(int attackPower, int targetHealth) {
+    private AttackResultVO performAttack(int attackPower, int targetHealth,
+                                          double critRate, double comboRate, double dodgeRate, int defense) {
         AttackResultVO result = new AttackResultVO();
 
         // 判断是否闪避
-        if (random.nextDouble() < DODGE_RATE) {
+        if (random.nextDouble() < dodgeRate) {
             result.setDodge(true);
             result.setDamage(0);
             return result;
         }
 
         // 判断是否连击
-        boolean isCombo = random.nextDouble() < COMBO_RATE;
+        boolean isCombo = random.nextDouble() < comboRate;
         result.setCombo(isCombo);
 
         // 判断是否暴击
-        boolean isCritical = random.nextDouble() < CRITICAL_RATE;
+        boolean isCritical = random.nextDouble() < critRate;
         result.setCritical(isCritical);
 
         // 计算伤害
@@ -268,9 +301,13 @@ public class BossServiceImpl implements BossService {
             damageMultiplier *= COMBO_DAMAGE_MULTIPLIER;
         }
 
+        // 防御力减伤：每1点防御减少1点伤害，最低造成1点伤害
+        int baseDamage = (int) (attackPower * damageMultiplier);
+        int damageAfterDefense = Math.max(1, baseDamage - defense);
+
         // 伤害有10%的浮动 // 0.9-1.1
         double damageVariation = 0.9 + random.nextDouble() * 0.2;
-        int damage = (int) (attackPower * damageMultiplier * damageVariation);
+        int damage = (int) (damageAfterDefense * damageVariation);
 
         // 确保伤害不超过目标当前血量
         damage = Math.min(damage, targetHealth);
@@ -280,17 +317,51 @@ public class BossServiceImpl implements BossService {
     }
 
     /**
+     * 执行攻击（不带防御力参数的重载方法，用于宠物攻击Boss）
+     *
+     * @param attackPower 攻击力
+     * @param targetHealth 目标当前血量
+     * @param critRate 暴击概率
+     * @param comboRate 连击概率
+     * @param dodgeRate 闪避概率
+     * @return 攻击结果
+     */
+    private AttackResultVO performAttack(int attackPower, int targetHealth,
+                                          double critRate, double comboRate, double dodgeRate) {
+        return performAttack(attackPower, targetHealth, critRate, comboRate, dodgeRate, 0);
+    }
+
+    /**
      * 根据ID获取Boss
      *
      * @param bossId Boss ID
      * @return Boss信息
      */
     private BossVO getBossById(Long bossId) {
-        List<BossVO> bossList = getBossList();
-        return bossList.stream()
-                .filter(boss -> boss.getId().equals(bossId))
-                .findFirst()
-                .orElse(null);
+        Boss boss = bossMapper.selectById(bossId);
+        if (boss == null || boss.getIsDelete() == 1 || boss.getStatus() == 0) {
+            return null;
+        }
+        BossVO vo = new BossVO();
+        vo.setId(boss.getId());
+        vo.setName(boss.getName());
+        vo.setAvatar(boss.getAvatar());
+        vo.setHealth(boss.getHealth());
+        vo.setAttack(boss.getAttack());
+        vo.setRewardPoints(boss.getRewardPoints());
+        // 主动属性
+        vo.setCritRate(boss.getCritRate());
+        vo.setComboRate(boss.getComboRate());
+        vo.setDodgeRate(boss.getDodgeRate());
+        vo.setBlockRate(boss.getBlockRate());
+        vo.setLifesteal(boss.getLifesteal());
+        // 抗性属性
+        vo.setCritResistance(boss.getCritResistance());
+        vo.setComboResistance(boss.getComboResistance());
+        vo.setDodgeResistance(boss.getDodgeResistance());
+        vo.setBlockResistance(boss.getBlockResistance());
+        vo.setLifestealResistance(boss.getLifestealResistance());
+        return vo;
     }
 
     /**
@@ -344,44 +415,58 @@ public class BossServiceImpl implements BossService {
     }
 
     /**
-     * 检查用户今天是否已经挑战过这个Boss
+     * 获取用户今天剩余的挑战次数
      *
      * @param userId 用户ID
      * @param bossId Boss ID
-     * @return 是否已挑战过
+     * @return 剩余挑战次数
      */
-    private boolean hasUserBattledToday(Long userId, Long bossId) {
+    private int getRemainingDailyChallenges(Long userId, Long bossId) {
         try {
             String dateStr = LocalDate.now().toString();
             String battleKey = RedisKey.getKey(RedisKey.BOSS_BATTLE_USER_DAILY_KEY, userId, bossId, dateStr);
             String value = redisTemplate.opsForValue().get(battleKey);
-            return value != null && !value.isEmpty();
+            
+            int usedChallenges = 0;
+            if (value != null && !value.isEmpty()) {
+                usedChallenges = Integer.parseInt(value);
+            }
+            
+            return MAX_DAILY_CHALLENGES - usedChallenges;
         } catch (Exception e) {
-            log.error("检查用户Boss挑战记录失败，userId: {}, bossId: {}", userId, bossId, e);
-            // 如果检查失败，为了安全起见，返回true（不允许挑战）
-            return true;
+            log.error("获取用户Boss挑战次数失败，userId: {}, bossId: {}", userId, bossId, e);
+            // 如果检查失败，为了安全起见，返回0（不允许挑战）
+            return 0;
         }
     }
 
     /**
-     * 标记用户今天已挑战过这个Boss
+     * 增加用户今天挑战次数
      *
      * @param userId 用户ID
      * @param bossId Boss ID
      */
-    private void markUserBattledToday(Long userId, Long bossId) {
+    private void incrementDailyChallengeCount(Long userId, Long bossId) {
         try {
             String dateStr = LocalDate.now().toString();
             String battleKey = RedisKey.getKey(RedisKey.BOSS_BATTLE_USER_DAILY_KEY, userId, bossId, dateStr);
+            
+            // 获取当前次数并+1
+            String value = redisTemplate.opsForValue().get(battleKey);
+            int currentCount = 0;
+            if (value != null && !value.isEmpty()) {
+                currentCount = Integer.parseInt(value);
+            }
+            currentCount++;
             
             // 计算到明天凌晨的过期时间
             LocalDateTime now = LocalDateTime.now();
             LocalDateTime nextDayMidnight = now.plusDays(1).withHour(0).withMinute(0).withSecond(0).withNano(0);
             long expireSeconds = ChronoUnit.SECONDS.between(now, nextDayMidnight);
             
-            redisTemplate.opsForValue().set(battleKey, "1", expireSeconds, TimeUnit.SECONDS);
+            redisTemplate.opsForValue().set(battleKey, String.valueOf(currentCount), expireSeconds, TimeUnit.SECONDS);
         } catch (Exception e) {
-            log.error("标记用户Boss挑战记录失败，userId: {}, bossId: {}", userId, bossId, e);
+            log.error("增加用户Boss挑战次数失败，userId: {}, bossId: {}", userId, bossId, e);
         }
     }
 
@@ -517,8 +602,18 @@ public class BossServiceImpl implements BossService {
 
         // 计算宠物的攻击力和血量
         int petLevel = pet.getLevel() != null ? pet.getLevel() : 1;
-        int petAttack = petLevel;  // 攻击力等于等级
-        int petHealth = petLevel * 100;
+        
+        // 获取用户的宠物装备属性
+        PetEquipStatsVO petEquipStats = fishPetService.getPetEquipStats();
+        int equipAttack = petEquipStats != null && petEquipStats.getTotalBaseAttack() != null 
+                ? petEquipStats.getTotalBaseAttack() : 0;
+        int equipHp = petEquipStats != null && petEquipStats.getTotalBaseHp() != null 
+                ? petEquipStats.getTotalBaseHp() : 0;
+        
+        // 攻击力 = 等级 + 装备攻击力
+        int petAttack = petLevel + equipAttack;
+        // 血量 = 等级 * 100 + 装备生命值
+        int petHealth = petLevel * 100 + equipHp;
 
         // 从Redis获取Boss当前血量，如果不存在则使用初始血量
         int currentBossHealth = getBossHealthFromRedis(bossId, boss.getHealth());
@@ -534,6 +629,8 @@ public class BossServiceImpl implements BossService {
         petInfo.setLevel(petLevel);
         petInfo.setAttack(petAttack);
         petInfo.setHealth(petHealth);
+        // 获取宠物已穿戴的装备列表
+        petInfo.setEquippedItems(fishPetService.getEquippedItems(pet));
         result.setPetInfo(petInfo);
 
         // 设置Boss信息
@@ -550,5 +647,76 @@ public class BossServiceImpl implements BossService {
         return result;
     }
 
+    /**
+     * 分配Boss击败奖励
+     * 按排行榜排名百分比分配Boss总积分
+     *
+     * @param bossId Boss ID
+     * @param totalRewardPoints Boss总积分
+     */
+    @Override
+    public void distributeBossKillRewards(Long bossId, Integer totalRewardPoints) {
+        try {
+            // 检查是否已发放过奖励，防止重复发放
+            String rewardDistributedKey = RedisKey.getKey(RedisKey.BOSS_REWARD_DISTRIBUTED_KEY, bossId);
+            Boolean alreadyDistributed = redisTemplate.opsForValue().setIfAbsent(
+                    rewardDistributedKey, "1", BOSS_HEALTH_CACHE_EXPIRE_HOURS, TimeUnit.HOURS);
+            if (Boolean.FALSE.equals(alreadyDistributed)) {
+                log.info("Boss击败奖励已发放过，跳过，bossId: {}", bossId);
+                return;
+            }
+            
+            log.info("开始分配Boss击败奖励，bossId: {}, 总积分: {}", bossId, totalRewardPoints);
+            
+            String rankingKey = RedisKey.getKey(RedisKey.BOSS_CHALLENGE_RANKING_KEY, bossId);
+            
+            // 获取所有排行榜参与者（从第11名开始）
+            Set<ZSetOperations.TypedTuple<String>> allTuples = redisTemplate.opsForZSet()
+                    .reverseRangeWithScores(rankingKey, 0, -1);
+            
+            if (allTuples == null || allTuples.isEmpty()) {
+                log.warn("Boss击败时排行榜为空，bossId: {}", bossId);
+                return;
+            }
+            
+            int rank = 0;
+            for (ZSetOperations.TypedTuple<String> tuple : allTuples) {
+                Long userId = Long.parseLong(Objects.requireNonNull(tuple.getValue()));
+                double percentage;
+                
+                if (rank < BOSS_REWARD_PERCENTAGES.length) {
+                    // 前10名按百分比分配
+                    percentage = BOSS_REWARD_PERCENTAGES[rank];
+                } else {
+                    // 第11名及以后各得2%
+                    percentage = OTHER_PARTICIPANTS_REWARD_PERCENTAGE;
+                }
+                
+                int rewardPoints = (int) (totalRewardPoints * percentage);
+                
+                // 发放积分奖励
+                try {
+                    String description;
+                    if (rank < BOSS_REWARD_PERCENTAGES.length) {
+                        description = "击败Boss获得第" + (rank + 1) + "名奖励";
+                    } else {
+                        description = "击败Boss获得参与奖励（第" + (rank + 1) + "名）";
+                    }
+                    
+                    userPointsService.updateUsedPoints(userId, -rewardPoints, 
+                            "BOSS_KILL", bossId.toString(), description);
+                    log.info("Boss击败奖励发放成功，userId: {}, rank: {}, rewardPoints: {}", 
+                            userId, rank + 1, rewardPoints);
+                } catch (Exception e) {
+                    log.error("Boss击败奖励发放失败，userId: {}, rank: {}", userId, rank + 1, e);
+                }
+                
+                rank++;
+            }
+            
+            log.info("Boss击败奖励分配完成，bossId: {}，共{}人获得奖励", bossId, rank);
+        } catch (Exception e) {
+            log.error("分配Boss击败奖励失败，bossId: {}, totalRewardPoints: {}", bossId, totalRewardPoints, e);
+        }
+    }
 }
-

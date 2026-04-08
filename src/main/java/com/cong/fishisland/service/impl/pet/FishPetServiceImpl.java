@@ -12,16 +12,12 @@ import com.cong.fishisland.mapper.pet.FishPetMapper;
 import com.cong.fishisland.model.dto.pet.CreatePetRequest;
 import com.cong.fishisland.model.dto.pet.UpdatePetNameRequest;
 import com.cong.fishisland.model.entity.pet.FishPet;
-import com.cong.fishisland.model.vo.pet.OtherUserPetVO;
-import com.cong.fishisland.model.vo.pet.PetRankVO;
-import com.cong.fishisland.model.vo.pet.PetSkinVO;
-import com.cong.fishisland.model.vo.pet.PetVO;
+import com.cong.fishisland.model.vo.pet.*;
 import com.cong.fishisland.model.entity.user.User;
-import com.cong.fishisland.service.FishPetService;
-import com.cong.fishisland.service.PetSkinService;
-import com.cong.fishisland.service.UserPointsService;
-import com.cong.fishisland.service.UserTitleService;
-import com.cong.fishisland.service.UserService;
+import com.cong.fishisland.service.*;
+
+import static com.cong.fishisland.model.enums.user.PointsRecordSourceEnum.*;
+
 import com.cong.fishisland.service.event.EventRemindHandler;
 import com.cong.fishisland.utils.RedisUtils;
 import lombok.RequiredArgsConstructor;
@@ -53,6 +49,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
     private final UserTitleService userTitleService;
     private final UserService userService;
     private final EventRemindHandler eventRemindHandler;
+    private final ItemInstancesService itemInstancesService;
 
 
     // 每次喂食增加的饥饿度
@@ -68,7 +65,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
     // 修改宠物名字消耗的积分
     private static final int RENAME_POINT_COST = 100;
     // 宠物等级上限
-    private static final int PET_LEVEL_MAX = 30;
+    private static final int PET_LEVEL_MAX = 60;
 
     // 宠物排行榜缓存时间（24小时）
     private static final Duration PET_RANK_CACHE_DURATION = Duration.ofHours(24);
@@ -154,7 +151,201 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         List<PetSkinVO> petSkins = this.getPetSkins(fishPet.getPetId());
         petVO.setSkins(petSkins);
 
+        // 获取已穿戴的装备列表
+        Map<String, ItemInstanceVO> equippedItems = getEquippedItems(fishPet);
+        petVO.setEquippedItems(equippedItems);
+
         return petVO;
+    }
+
+    /**
+     * 从宠物扩展数据中获取已穿戴的装备列表
+     *
+     * @param fishPet 宠物实体
+     * @return 槽位 -> 装备VO 的映射
+     */
+    @Override
+    public Map<String, ItemInstanceVO> getEquippedItems(FishPet fishPet) {
+        Map<String, ItemInstanceVO> result = new HashMap<>();
+        
+        if (fishPet.getExtendData() == null || fishPet.getExtendData().isEmpty()) {
+            return result;
+        }
+
+        JSONObject extendData = JSON.parseObject(fishPet.getExtendData());
+        if (!extendData.containsKey("equippedItems")) {
+            return result;
+        }
+
+        JSONObject equippedItemsJson = extendData.getJSONObject("equippedItems");
+        if (equippedItemsJson == null || equippedItemsJson.isEmpty()) {
+            return result;
+        }
+
+        // 遍历所有槽位，获取装备详情
+        for (String slot : equippedItemsJson.keySet()) {
+            Long itemInstanceId = equippedItemsJson.getLong(slot);
+            if (itemInstanceId != null) {
+                ItemInstanceVO itemInstanceVO = itemInstancesService.getItemInstanceById(itemInstanceId);
+                if (itemInstanceVO != null) {
+                    // 解析装备属性
+                    SingleEquipStatsVO equipStats = parseEquipStats(itemInstanceVO);
+                    itemInstanceVO.setEquipStats(equipStats);
+                    result.put(slot, itemInstanceVO);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * 解析单个装备的属性
+     *
+     * @param itemInstanceVO 装备VO
+     * @return 装备属性VO
+     */
+    private SingleEquipStatsVO parseEquipStats(ItemInstanceVO itemInstanceVO) {
+        SingleEquipStatsVO statsVO = new SingleEquipStatsVO();
+        
+        // 初始化默认值
+        statsVO.setBaseAttack(0);
+        statsVO.setBaseDefense(0);
+        statsVO.setBaseHp(0);
+        statsVO.setCritRate(0.0);
+        statsVO.setComboRate(0.0);
+        statsVO.setDodgeRate(0.0);
+        statsVO.setBlockRate(0.0);
+        statsVO.setLifesteal(0.0);
+        statsVO.setCritResistance(0.0);
+        statsVO.setComboResistance(0.0);
+        statsVO.setDodgeResistance(0.0);
+        statsVO.setBlockResistance(0.0);
+        statsVO.setLifestealResistance(0.0);
+
+        if (itemInstanceVO == null || itemInstanceVO.getTemplate() == null) {
+            return statsVO;
+        }
+
+        ItemTemplateVO template = itemInstanceVO.getTemplate();
+
+        // 基础属性
+        if (template.getBaseAttack() != null) {
+            statsVO.setBaseAttack(template.getBaseAttack());
+        }
+        if (template.getBaseDefense() != null) {
+            statsVO.setBaseDefense(template.getBaseDefense());
+        }
+        if (template.getBaseHp() != null) {
+            statsVO.setBaseHp(template.getBaseHp());
+        }
+
+        // 解析 mainAttr 属性
+        if (template.getMainAttr() != null) {
+            parseMainAttrForSingleEquip(template.getMainAttr(), statsVO);
+        }
+
+        return statsVO;
+    }
+
+    /**
+     * 解析单个装备的 mainAttr 属性
+     * mainAttr 格式: {"critRate":0.1, ...} 或 "{\"critRate\":0.1}"
+     *
+     * @param mainAttr 属性JSON
+     * @param statsVO  装备属性VO
+     */
+    private void parseMainAttrForSingleEquip(Object mainAttr, SingleEquipStatsVO statsVO) {
+        try {
+            if (mainAttr == null) {
+                return;
+            }
+
+            String mainAttrStr;
+            if (mainAttr instanceof String) {
+                mainAttrStr = (String) mainAttr;
+            } else {
+                mainAttrStr = JSON.toJSONString(mainAttr);
+            }
+
+            if (mainAttrStr == null || mainAttrStr.isEmpty()|| "null".equals(mainAttrStr)) {
+                return;
+            }
+
+            // 处理双重转义的 JSON 字符串: "{\"critRate\":0.1}"
+            if (mainAttrStr.startsWith("\"") && mainAttrStr.endsWith("\"")) {
+                // 先解析一次得到原始 JSON 字符串
+                mainAttrStr = JSON.parseObject(mainAttrStr, String.class);
+                if (mainAttrStr == null || mainAttrStr.isEmpty()) {
+                    return;
+                }
+            }
+
+            // 解析 JSON 对象格式 {"critRate":0.1}
+            Map<String, Object> attrMap = JSON.parseObject(mainAttrStr, Map.class);
+            if (attrMap == null) {
+                return;
+            }
+
+            for (Map.Entry<String, Object> entry : attrMap.entrySet()) {
+                String key = entry.getKey();
+                Object valueObj = entry.getValue();
+
+                if (key == null || valueObj == null) {
+                    continue;
+                }
+
+                double value;
+                if (valueObj instanceof Number) {
+                    value = ((Number) valueObj).doubleValue();
+                } else {
+                    try {
+                        value = Double.parseDouble(valueObj.toString());
+                    } catch (NumberFormatException e) {
+                        continue;
+                    }
+                }
+
+                // 设置对应属性
+                switch (key) {
+                    case "critRate":
+                        statsVO.setCritRate(value);
+                        break;
+                    case "comboRate":
+                        statsVO.setComboRate(value);
+                        break;
+                    case "dodgeRate":
+                        statsVO.setDodgeRate(value);
+                        break;
+                    case "blockRate":
+                        statsVO.setBlockRate(value);
+                        break;
+                    case "lifesteal":
+                        statsVO.setLifesteal(value);
+                        break;
+                    case "critResistance":
+                        statsVO.setCritResistance(value);
+                        break;
+                    case "comboResistance":
+                        statsVO.setComboResistance(value);
+                        break;
+                    case "dodgeResistance":
+                        statsVO.setDodgeResistance(value);
+                        break;
+                    case "blockResistance":
+                        statsVO.setBlockResistance(value);
+                        break;
+                    case "lifestealResistance":
+                        statsVO.setLifestealResistance(value);
+                        break;
+                    default:
+                        // 未知属性，忽略
+                        break;
+                }
+            }
+        } catch (Exception e) {
+            log.error("解析装备 mainAttr 属性失败: {}", mainAttr, e);
+        }
     }
 
     @Override
@@ -188,7 +379,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         }
 
         // 扣除用户积分
-        userPointsService.deductPoints(userId, RENAME_POINT_COST);
+        userPointsService.deductPoints(userId, RENAME_POINT_COST, PET_RENAME.getValue(), null, "宠物改名");
 
         // 修改名称
         fishPet.setName(name);
@@ -230,7 +421,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         FishPet fishPet = checkPetOwnership(petId, userId);
 
         if (fishPet.getLevel() >= PET_LEVEL_MAX){
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "宠物已经达到30级，已会自己补充饥饿度");
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "宠物已经达到60级，已会自己补充饥饿度");
         }
 
         // 检查饥饿度是否已满
@@ -239,7 +430,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         }
 
         // 扣除用户积分
-        userPointsService.deductPoints(userId, FEED_POINT_COST);
+        userPointsService.deductPoints(userId, FEED_POINT_COST, PET_FEED.getValue(), null, "宠物喂食");
 
         // 更新宠物饥饿度和心情值
         int newHunger = Math.min(100, fishPet.getHunger() + FEED_HUNGER_INCREASE);
@@ -274,7 +465,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         FishPet fishPet = checkPetOwnership(petId, userId);
 
         if (fishPet.getLevel() >= PET_LEVEL_MAX){
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "宠物已经达到30级，已会自己补充心情值");
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "宠物已经达到60级，已会自己补充心情值");
         }
         // 检查心情值是否已满
         if (fishPet.getMood() >= 100) {
@@ -282,7 +473,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         }
 
         // 扣除用户积分
-        userPointsService.deductPoints(userId, PAT_POINT_COST);
+        userPointsService.deductPoints(userId, PAT_POINT_COST, PET_PAT.getValue(), null, "宠物抚摸");
 
         // 更新宠物心情值
         int newMood = Math.min(100, fishPet.getMood() + PAT_MOOD_INCREASE);
@@ -321,11 +512,11 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
             return 0;
         }
 
-        // 在更新之前，查询哪些宠物会升到30级
+        // 在更新之前，查询哪些宠物会升到60级
         List<FishPet> petsToUpgrade = baseMapper.selectList(
             new LambdaQueryWrapper<FishPet>()
                 .in(FishPet::getUserId, userIds)
-                .eq(FishPet::getLevel, 29)
+                .eq(FishPet::getLevel, 59)
                 .ge(FishPet::getExp, 99) // 经验值为99，+1后会达到100
                 .and(wrapper -> wrapper.gt(FishPet::getHunger, 0).or().gt(FishPet::getMood, 0))
                 .eq(FishPet::getIsDelete, 0)
@@ -333,19 +524,19 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
 
         // 注意：在SQL实现中，只有当宠物的饥饿度(hunger)或心情值(mood)任意一个大于0时，
         // 宠物才会获得经验并可能升级。这确保了宠物得到基本照顾就能成长。
-        // 当宠物升级到30级时，经验值会设为100，饥饿度设为0，心情值设为100。
+        // 当宠物升级到60级时，经验值会设为100，饥饿度设为0，心情值设为100。
         int updatedCount = baseMapper.batchUpdateOnlineUserPetExp(userIds);
         
-        // 为升到30级的宠物记录时间到Redis
+        // 为升到60级的宠物记录时间到Redis
         if (!petsToUpgrade.isEmpty()) {
             String currentTime = String.valueOf(System.currentTimeMillis());
             for (FishPet pet : petsToUpgrade) {
-                String petLevel30TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_30_TIME, pet.getUserId().toString());
+                String petLevel60TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_60_TIME, pet.getUserId().toString());
                 // 只有当Redis中还没有记录时才设置（避免重复设置）
-                if (!RedisUtils.hasKey(petLevel30TimeKey)) {
+                if (!RedisUtils.hasKey(petLevel60TimeKey)) {
                     // 永久存储，用于排行榜排序
-                    RedisUtils.set(petLevel30TimeKey, currentTime, Duration.ofDays(365 * 10)); // 10年过期时间，基本等于永久
-                    log.info("用户{}的宠物达到30级，记录时间：{}", pet.getUserId(), currentTime);
+                    RedisUtils.set(petLevel60TimeKey, currentTime, Duration.ofDays(365 * 10)); // 10年过期时间，基本等于永久
+                    log.info("用户{}的宠物达到60级，记录时间：{}", pet.getUserId(), currentTime);
                 }
             }
         }
@@ -376,7 +567,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
                 int pointsToAdd = Math.min(level, maxPoints);
 
                 // 为用户增加积分（非签到积分）
-                userPointsService.updateUsedPoints(userId, -pointsToAdd);
+                userPointsService.updateUsedPoints(userId, -pointsToAdd, PET_DAILY.getValue(), null, "宠物每日产出积分");
 
                 log.info("宠物产出积分：用户ID={}, 宠物等级={}, 产出积分={}", userId, level, pointsToAdd);
                 count++;
@@ -516,10 +707,10 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
                 return levelCompare;
             }
             
-            // 如果等级相同且都是30级，按到达30级的时间排序
-            if (pet1.getLevel() == 30 && pet2.getLevel() == 30) {
-                String pet1TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_30_TIME, pet1.getUserId().toString());
-                String pet2TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_30_TIME, pet2.getUserId().toString());
+            // 如果等级相同且都是60级，按到达60级的时间排序
+            if (pet1.getLevel() == 60 && pet2.getLevel() == 60) {
+                String pet1TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_60_TIME, pet1.getUserId().toString());
+                String pet2TimeKey = PetRedisKey.getKey(PetRedisKey.PET_LEVEL_60_TIME, pet2.getUserId().toString());
                 
                 String pet1Time = RedisUtils.get(pet1TimeKey);
                 String pet2Time = RedisUtils.get(pet2TimeKey);
@@ -531,7 +722,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
                         long time2 = Long.parseLong(pet2Time);
                         return Long.compare(time1, time2);
                     } catch (NumberFormatException e) {
-                        log.warn("解析宠物30级时间失败，userId1: {}, userId2: {}", pet1.getUserId(), pet2.getUserId());
+                        log.warn("解析宠物60级时间失败，userId1: {}, userId2: {}", pet1.getUserId(), pet2.getUserId());
                     }
                 }
                 
@@ -547,7 +738,7 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
                 return Integer.compare(pet2.getExp(), pet1.getExp());
             }
             
-            // 如果不是30级，按经验值排序（降序）
+            // 如果不是60级，按经验值排序（降序）
             return Integer.compare(pet2.getExp(), pet1.getExp());
         });
     }
@@ -761,6 +952,178 @@ public class FishPetServiceImpl extends ServiceImpl<FishPetMapper, FishPet> impl
         } catch (Exception e) {
             log.error("宠物排行榜称号更新任务执行异常", e);
             return 0;
+        }
+    }
+
+    @Override
+    public PetEquipStatsVO getPetEquipStats() {
+        if (!StpUtil.isLogin()) {
+            return null;
+        }
+
+        Long userId = StpUtil.getLoginIdAsLong();
+
+        // 查询宠物
+        QueryWrapper<FishPet> queryWrapper = new QueryWrapper<>();
+        queryWrapper.eq("userId", userId);
+        FishPet fishPet = this.getOne(queryWrapper);
+
+        if (fishPet == null) {
+            return null;
+        }
+
+        // 获取已穿戴的装备列表
+        Map<String, ItemInstanceVO> equippedItems = getEquippedItems(fishPet);
+
+        // 初始化属性统计
+        PetEquipStatsVO statsVO = new PetEquipStatsVO();
+        statsVO.setTotalBaseAttack(0);
+        statsVO.setTotalBaseDefense(0);
+        statsVO.setTotalBaseHp(0);
+        statsVO.setCritRate(0.0);
+        statsVO.setComboRate(0.0);
+        statsVO.setDodgeRate(0.0);
+        statsVO.setBlockRate(0.0);
+        statsVO.setLifesteal(0.0);
+        statsVO.setCritResistance(0.0);
+        statsVO.setComboResistance(0.0);
+        statsVO.setDodgeResistance(0.0);
+        statsVO.setBlockResistance(0.0);
+        statsVO.setLifestealResistance(0.0);
+
+        // 如果没有装备，直接返回
+        if (equippedItems == null || equippedItems.isEmpty()) {
+            return statsVO;
+        }
+
+        // 遍历所有装备，累加属性
+        for (ItemInstanceVO item : equippedItems.values()) {
+            if (item == null || item.getTemplate() == null) {
+                continue;
+            }
+
+            ItemTemplateVO template = item.getTemplate();
+
+            // 累加基础属性
+            if (template.getBaseAttack() != null) {
+                statsVO.setTotalBaseAttack(statsVO.getTotalBaseAttack() + template.getBaseAttack());
+            }
+            if (template.getBaseDefense() != null) {
+                statsVO.setTotalBaseDefense(statsVO.getTotalBaseDefense() + template.getBaseDefense());
+            }
+            if (template.getBaseHp() != null) {
+                statsVO.setTotalBaseHp(statsVO.getTotalBaseHp() + template.getBaseHp());
+            }
+
+            // 解析 mainAttr 属性
+            if (template.getMainAttr() != null) {
+                parseMainAttr(template.getMainAttr(), statsVO);
+            }
+        }
+
+        return statsVO;
+    }
+
+    /**
+     * 解析装备的 mainAttr 属性，累加到统计VO中
+     * mainAttr 格式: {"critRate":0.1, ...} 或 "{\"critRate\":0.1}"
+     *
+     * @param mainAttr 属性JSON
+     * @param statsVO  统计VO
+     */
+    private void parseMainAttr(Object mainAttr, PetEquipStatsVO statsVO) {
+        try {
+            if (mainAttr == null) {
+                return;
+            }
+
+            String mainAttrStr;
+            if (mainAttr instanceof String) {
+                mainAttrStr = (String) mainAttr;
+            } else {
+                mainAttrStr = JSON.toJSONString(mainAttr);
+            }
+
+            if (mainAttrStr == null || mainAttrStr.isEmpty() || "null".equals(mainAttrStr)) {
+                return;
+            }
+
+            // 处理双重转义的 JSON 字符串: "{\"critRate\":0.1}"
+            if (mainAttrStr.startsWith("\"") && mainAttrStr.endsWith("\"")) {
+                // 先解析一次得到原始 JSON 字符串
+                mainAttrStr = JSON.parseObject(mainAttrStr, String.class);
+                if (mainAttrStr == null || mainAttrStr.isEmpty()) {
+                    return;
+                }
+            }
+
+            // 解析 JSON 对象格式 {"critRate":0.1}
+            Map<String, Object> attrMap = JSON.parseObject(mainAttrStr, Map.class);
+            if (attrMap == null) {
+                return;
+            }
+
+            for (Map.Entry<String, Object> entry : attrMap.entrySet()) {
+                if (entry == null) {
+                    continue;
+                }
+                String key = entry.getKey();
+                Object valueObj = entry.getValue();
+
+                if (key == null || valueObj == null) {
+                    continue;
+                }
+
+                double value;
+                if (valueObj instanceof Number) {
+                    value = ((Number) valueObj).doubleValue();
+                } else {
+                    try {
+                        value = Double.parseDouble(valueObj.toString());
+                    } catch (NumberFormatException e) {
+                        continue;
+                    }
+                }
+
+                // 累加对应属性
+                switch (key) {
+                    case "critRate":
+                        statsVO.setCritRate(statsVO.getCritRate() + value);
+                        break;
+                    case "comboRate":
+                        statsVO.setComboRate(statsVO.getComboRate() + value);
+                        break;
+                    case "dodgeRate":
+                        statsVO.setDodgeRate(statsVO.getDodgeRate() + value);
+                        break;
+                    case "blockRate":
+                        statsVO.setBlockRate(statsVO.getBlockRate() + value);
+                        break;
+                    case "lifesteal":
+                        statsVO.setLifesteal(statsVO.getLifesteal() + value);
+                        break;
+                    case "critResistance":
+                        statsVO.setCritResistance(statsVO.getCritResistance() + value);
+                        break;
+                    case "comboResistance":
+                        statsVO.setComboResistance(statsVO.getComboResistance() + value);
+                        break;
+                    case "dodgeResistance":
+                        statsVO.setDodgeResistance(statsVO.getDodgeResistance() + value);
+                        break;
+                    case "blockResistance":
+                        statsVO.setBlockResistance(statsVO.getBlockResistance() + value);
+                        break;
+                    case "lifestealResistance":
+                        statsVO.setLifestealResistance(statsVO.getLifestealResistance() + value);
+                        break;
+                    default:
+                        // 未知属性，忽略
+                        break;
+                }
+            }
+        } catch (Exception e) {
+            log.error("解析装备 mainAttr 属性失败: {}", mainAttr, e);
         }
     }
 } 

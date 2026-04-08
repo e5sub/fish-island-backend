@@ -31,14 +31,14 @@ public class PetStatusUpdateJob {
     // 每小时心情值减少值
     private static final int MOOD_DECREMENT = 3;
     // 宠物产出积分的最大值
-    private static final int MAX_PET_POINTS = 30;
+    private static final int MAX_PET_POINTS = 60;
 
 
     /**
      * 每小时更新宠物经验
      * 注意：只有当饥饿度和心情值都大于0时，宠物才会获得经验
      */
-    @Scheduled(fixedRate = 3600000)
+    @Scheduled(fixedRate = 3600000, initialDelay = 3600000)
     public void updatePetLevel() {
         List<UserChatResponse> onlineUserList = webSocketService.getOnlineUserList();
         if (onlineUserList.isEmpty()) {
@@ -66,10 +66,10 @@ public class PetStatusUpdateJob {
     /**
      * 每小时更新宠物状态
      * 每小时扣除5点饥饿度、3点心情值
-     * 注意：30级宠物不会扣除饥饿度和心情值，会自动保持满值
+     * 注意：60级宠物不会扣除饥饿度和心情值，会自动保持满值
      * 注意：饥饿度和心情值为0的宠物无法获得经验
      */
-    @Scheduled(fixedRate = 3600000)
+    @Scheduled(fixedRate = 3600000, initialDelay = 3600000)
     public void updatePetStatus() {
         log.info("开始执行宠物状态更新任务");
 
@@ -79,7 +79,7 @@ public class PetStatusUpdateJob {
 
             if (updatedCount > 0) {
                 log.info("宠物状态批量更新成功，共更新{}个宠物", updatedCount);
-                log.info("提醒：30级宠物状态保持满值，其他宠物扣除饥饿度和心情值");
+                log.info("提醒：60级宠物状态保持满值，其他宠物扣除饥饿度和心情值");
                 log.info("提醒：饥饿度和心情值为0的宠物将无法获得经验和升级");
             } else {
                 log.info("没有宠物需要更新状态");
